@@ -7,13 +7,12 @@ import (
 	"log"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/emersion/go-sasl"
 )
-
-var errTCPAndLMTP = errors.New("smtp: cannot start LMTP server listening on a TCP socket")
 
 // A function that creates SASL servers.
 type SaslServerFactory func(conn *Conn) sasl.Server
@@ -30,8 +29,7 @@ type Server struct {
 	Addr string
 	// The server TLS configuration.
 	TLSConfig *tls.Config
-	// Enable LMTP mode, as defined in RFC 2033. LMTP mode cannot be used with a
-	// TCP listener.
+	// Enable LMTP mode.
 	LMTP bool
 
 	Domain            string
@@ -204,16 +202,23 @@ func (s *Server) handleConn(c *Conn) error {
 // ListenAndServe listens on the network address s.Addr and then calls Serve
 // to handle requests on incoming connections.
 //
-// If s.Addr is blank and LMTP is disabled, ":smtp" is used.
+// If s.Addr is blank and LMTP is disabled, ":smtp" is used. If it is enabled,
+// ":24" (any private mail system) is used.
+// If s.Addr contains "/", UNIX domain socket is used. Otherwise TCP socket
+// is used.
 func (s *Server) ListenAndServe() error {
-	network := "tcp"
-	if s.LMTP {
-		network = "unix"
+	addr := s.Addr
+	if addr == "" {
+		if s.LMTP {
+			addr = ":24"
+		} else {
+			addr = ":smtp"
+		}
 	}
 
-	addr := s.Addr
-	if !s.LMTP && addr == "" {
-		addr = ":smtp"
+	network := "tcp"
+	if strings.Contains(addr, "/") {
+		network = "unix"
 	}
 
 	l, err := net.Listen(network, addr)
@@ -227,18 +232,21 @@ func (s *Server) ListenAndServe() error {
 // ListenAndServeTLS listens on the TCP network address s.Addr and then calls
 // Serve to handle requests on incoming TLS connections.
 //
-// If s.Addr is blank, ":smtps" is used.
+// If s.Addr is blank, ":465" (Message Submission over TLS) is used.
+// If s.Addr contains "/", UNIX domain socket is used. Otherwise TCP socket
+// is used.
 func (s *Server) ListenAndServeTLS() error {
-	if s.LMTP {
-		return errTCPAndLMTP
-	}
-
 	addr := s.Addr
 	if addr == "" {
-		addr = ":smtps"
+		addr = ":465"
 	}
 
-	l, err := tls.Listen("tcp", addr, s.TLSConfig)
+	network := "tcp"
+	if strings.Contains(addr, "/") {
+		network = "unix"
+	}
+
+	l, err := tls.Listen(network, addr, s.TLSConfig)
 	if err != nil {
 		return err
 	}
