@@ -267,6 +267,9 @@ func (c *Conn) handleGreet(enhanced bool, arg string) {
 	if c.server.EnableBINARYMIME {
 		caps = append(caps, "BINARYMIME")
 	}
+	if c.server.EnableDSN {
+		caps = append(caps, "DSN")
+	}
 	if c.server.MaxMessageBytes > 0 {
 		caps = append(caps, fmt.Sprintf("SIZE %v", c.server.MaxMessageBytes))
 	} else {
@@ -353,6 +356,30 @@ func (c *Conn) handleMail(arg string) {
 				return
 			}
 			opts.Body = BodyType(value)
+		case "RET":
+			if !c.server.EnableDSN {
+				c.writeResponse(504, EnhancedCode{5, 5, 4}, "RET is not implemented")
+				return
+			}
+			value = strings.ToUpper(value)
+			switch value {
+			case "FULL", "HDRS":
+			default:
+				c.writeResponse(501, EnhancedCode{5, 5, 4}, "Unknown RET value")
+				return
+			}
+			opts.Ret = RetType(value)
+		case "ENVID":
+			if !c.server.EnableDSN {
+				c.writeResponse(504, EnhancedCode{5, 5, 4}, "ENVID is not implemented")
+				return
+			}
+			value, err := decodeXtext(value)
+			if err != nil || value == "" || !isPrintableASCII(value) {
+				c.writeResponse(501, EnhancedCode{5, 5, 4}, "Malformed ENVID parameter value")
+				return
+			}
+			opts.Envid = value
 		case "AUTH":
 			value, err := decodeXtext(value)
 			if err != nil || value == "" {
@@ -421,6 +448,87 @@ func decodeXtext(val string) (string, error) {
 	return decoded, nil
 }
 
+// This regexp matches 'EmbeddedUnicodeChar' token defined in
+// https://datatracker.ietf.org/doc/html/rfc6533.html#section-3
+// however it is intentionally relaxed by requiring only '\x{HEX}' to be
+// present.  It also matches disallowed characters in QCHAR and QUCHAR defined
+// in above.
+// So it allows us to detect malformed values and report them appropriately.
+var eUOrDCharRe = regexp.MustCompile(`\\x[{][0-9A-F]+[}]|[[:cntrl:] \\+=]`)
+
+// Decodes the utf-8-addr-xtext or the utf-8-addr-unitext form.
+func decodeUTF8AddrXtext(val string) (string, error) {
+	var replaceErr error
+	decoded := eUOrDCharRe.ReplaceAllStringFunc(val, func(match string) string {
+		if len(match) == 1 {
+			replaceErr = errors.New("disallowed character")
+			return ""
+		}
+
+		hexpoint := match[3 : len(match)-1]
+		l := len(hexpoint)
+		char, err := strconv.ParseUint(hexpoint, 16, 21)
+		if err != nil {
+			replaceErr = err
+			return ""
+		}
+		switch {
+		case l == 2 && (0x01 <= char && char <= 0x09 ||
+			0x11 <= char && char <= 0x19 || char == 0x10 ||
+			char == 0x20 ||
+			// all xtext-specials
+			char == 0x2B || char == 0x3D || char == 0x7F ||
+			// 2-digit forms
+			char == 0x5C || 0x80 <= char && char <= 0xFF):
+		// 3-digit forms
+		case l == 3 && 0x100 <= char && char <= 0xFFF:
+		// 4-digit forms excluding surrogate
+		case l == 4 && (0x1000 <= char && char <= 0xD7FF ||
+			0xE000 <= char && char <= 0xFFFF):
+		// 5-digit forms
+		case l == 5 && 0x1_0000 <= char && char <= 0xF_FFFF:
+		// 6-digit forms
+		case l == 6 && 0x10_0000 <= char && char <= 0x10_FFFF:
+		default:
+			replaceErr = errors.New("illegal hexpoint")
+			return ""
+		}
+
+		return string(rune(char))
+	})
+	if replaceErr != nil {
+		return "", replaceErr
+	}
+
+	return decoded, nil
+}
+
+func decodeTypedAddress(val string) (OrcptTypeType, string, error) {
+	tv := strings.SplitN(val, ";", 2)
+	if len(tv) != 2 || tv[0] == "" || tv[1] == "" {
+		return "", "", errors.New("bad address")
+	}
+	aType, aAddr := strings.ToUpper(tv[0]), tv[1]
+
+	var err error
+	switch aType {
+	case "RFC822":
+		aAddr, err = decodeXtext(aAddr)
+		if err == nil && !isPrintableASCII(aAddr) {
+			err = errors.New("illegal address")
+		}
+	case "UTF-8":
+		aAddr, err = decodeUTF8AddrXtext(aAddr)
+	default:
+		err = errors.New("unknown address type")
+	}
+	if err != nil {
+		return "", "", err
+	}
+
+	return OrcptTypeType(aType), aAddr, nil
+}
+
 func encodeXtext(raw string) string {
 	var out strings.Builder
 	out.Grow(len(raw))
@@ -438,6 +546,15 @@ func encodeXtext(raw string) string {
 		out.WriteString(strings.ToUpper(strconv.FormatInt(int64(ch), 16)))
 	}
 	return out.String()
+}
+
+func isPrintableASCII(val string) bool {
+	for _, ch := range val {
+		if ch < ' ' || '~' < ch {
+			return false
+		}
+	}
+	return true
 }
 
 // MAIL state -> waiting for RCPTs followed by DATA
@@ -463,17 +580,60 @@ func (c *Conn) handleRcpt(arg string) {
 		c.writeResponse(501, EnhancedCode{5, 5, 2}, "Was expecting RCPT arg syntax of TO:<address>")
 		return
 	}
-	if len(strings.Fields(p.s)) > 0 {
-		c.writeResponse(501, EnhancedCode{5, 5, 2}, "RCPT parameters are not supported")
-		return
-	}
 
 	if c.server.MaxRecipients > 0 && len(c.recipients) >= c.server.MaxRecipients {
 		c.writeResponse(452, EnhancedCode{4, 5, 3}, fmt.Sprintf("Maximum limit of %v recipients reached", c.server.MaxRecipients))
 		return
 	}
 
+	args, err := parseArgs(p.s)
+	if err != nil {
+		c.writeResponse(501, EnhancedCode{5, 5, 4}, "Unable to parse RCPT ESMTP parameters")
+		return
+	}
+
 	opts := &RcptOptions{}
+
+	for key, value := range args {
+		switch key {
+		case "NOTIFY":
+			if !c.server.EnableDSN {
+				c.writeResponse(504, EnhancedCode{5, 5, 4}, "NOTIFY is not implemented")
+				return
+			}
+			value = strings.ToUpper(value)
+			if value == "NEVER" {
+				opts.Notify = []NotifyType{NotifyType(value)}
+			} else {
+				opts.Notify = []NotifyType{}
+				for _, val := range strings.Split(value, ",") {
+					switch val {
+					case "DELAY", "FAILURE", "SUCCESS":
+					default:
+						c.writeResponse(501, EnhancedCode{5, 5, 4}, "Malformed NOTIFY parameter value")
+						return
+					}
+					opts.Notify = append(opts.Notify, NotifyType(val))
+				}
+			}
+		case "ORCPT":
+			if !c.server.EnableDSN {
+				c.writeResponse(504, EnhancedCode{5, 5, 4}, "ORCPT is not implemented")
+				return
+			}
+			aType, aAddr, err := decodeTypedAddress(value)
+			if err != nil || aAddr == "" {
+				c.writeResponse(501, EnhancedCode{5, 5, 4}, "Malformed ORCPT parameter value")
+				return
+			}
+			opts.OrcptType = aType
+			opts.OrcptAddr = aAddr
+		default:
+			c.writeResponse(500, EnhancedCode{5, 5, 4}, "Unknown RCPT TO argument")
+			return
+		}
+	}
+
 	if err := c.Session().Rcpt(recipient, opts); err != nil {
 		if smtpErr, ok := err.(*SMTPError); ok {
 			c.writeResponse(smtpErr.Code, smtpErr.EnhancedCode, smtpErr.Message)
