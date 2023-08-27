@@ -400,6 +400,14 @@ func (c *Client) Mail(from string, opts *MailOptions) error {
 			return errors.New("smtp: server does not support SMTPUTF8")
 		}
 	}
+	if _, ok := c.ext["DSN"]; ok && opts != nil {
+		if opts.Ret != "" {
+			cmdStr += " RET=" + string(opts.Ret)
+		}
+		if opts.Envid != "" {
+			cmdStr += " ENVID=" + encodeXtext(opts.Envid)
+		}
+	}
 	if opts != nil && opts.Auth != nil {
 		if _, ok := c.ext["AUTH"]; ok {
 			cmdStr += " AUTH=" + encodeXtext(*opts.Auth)
@@ -422,7 +430,38 @@ func (c *Client) Rcpt(to string, opts *RcptOptions) error {
 	if err := validateLine(to); err != nil {
 		return err
 	}
-	if _, _, err := c.cmd(25, "RCPT TO:<%s>", to); err != nil {
+	cmdStr := "RCPT TO:<%s>"
+	if _, ok := c.ext["DSN"]; ok && opts != nil {
+		if opts.Notify != nil && len(opts.Notify) != 0 {
+			cmdStr += " NOTIFY="
+			for i, v := range opts.Notify {
+				if i != 0 {
+					cmdStr += ","
+				}
+				cmdStr += string(v)
+			}
+		}
+		if opts.OrcptAddr != "" {
+			var enc string
+			switch opts.OrcptType {
+			case OrcptTypeRFC822:
+				if !isPrintableASCII(opts.OrcptAddr) {
+					return errors.New("smtp: Illegal address")
+				}
+				enc = encodeXtext(opts.OrcptAddr)
+			case OrcptTypeUTF8:
+				if _, ok := c.ext["SMTPUTF8"]; ok {
+					enc = encodeUTF8AddrUnitext(opts.OrcptAddr)
+				} else {
+					enc = encodeUTF8AddrXtext(opts.OrcptAddr)
+				}
+			default:
+				return errors.New("smtp: Unknown address type")
+			}
+			cmdStr += " ORCPT=" + string(opts.OrcptType) + ";" + enc
+		}
+	}
+	if _, _, err := c.cmd(25, cmdStr, to); err != nil {
 		return err
 	}
 	c.rcpts = append(c.rcpts, to)
